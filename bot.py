@@ -31,18 +31,18 @@ BIẾN MÔI TRƯỜNG (khai báo trong Render > Environment):
 """
 
 import os
+import re
 import sqlite3
 import logging
 import uuid
 import random
 import threading
 import asyncio
-import http.server
-import socketserver
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import requests
+from flask import Flask, render_template_string
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -77,6 +77,8 @@ logging.basicConfig(
 logger = logging.getLogger("moneybot")
 
 BOT_USERNAME = None  # sẽ lấy tự động lúc khởi động
+MAIN_LOOP = None      # event loop của bot Telegram, để gọi từ thread Flask
+BOT_INSTANCE = None   # telegram.Bot, để gửi tin nhắn từ thread Flask
 
 # ============================================================
 # DATABASE
@@ -168,6 +170,7 @@ def init_db():
         "ref_bonus": "1000",
         "min_withdraw_task": "10000",
         "min_withdraw_ref": "50000",
+        "web_base_url": "",
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
@@ -263,20 +266,64 @@ def money_fmt(n):
 # ============================================================
 
 def create_link4m(destination_url: str) -> str | None:
+    """
+    Gọi API link4m để tạo link rút gọn. Hàm này cố gắng nhận diện nhiều kiểu
+    phản hồi khác nhau (JSON với nhiều tên field khác nhau, hoặc plain text
+    chỉ chứa mỗi URL), vì API các trang rút gọn link kiểu này không có chuẩn
+    thống nhất và có thể đổi format theo thời gian.
+
+    Nếu vẫn không tạo được link, toàn bộ raw response sẽ được ghi vào log
+    (logger.error) để có thể xem trên Render > Logs và chỉnh lại chính xác.
+    """
     api_key = cfg("link4m_api_key", LINK4M_API_KEY_DEFAULT)
     api_url = f"https://link4m.co/st?api={api_key}&url={quote(destination_url, safe='')}"
+
     try:
         resp = requests.get(api_url, timeout=15)
-        data = resp.json()
-        # link4m thường trả {"status":"success","shortenedUrl":"..."}
-        short = data.get("shortenedUrl") or data.get("shorten_url") or data.get("url")
-        if short:
-            return short
-        logger.warning("link4m response không đúng format: %s", data)
-        return None
     except Exception as e:
-        logger.error("Lỗi gọi API link4m: %s", e)
+        logger.error("Lỗi kết nối tới API link4m: %s", e)
         return None
+
+    raw_text = resp.text.strip()
+
+    # In log để đối chiếu khi cần - xem trên Render > Logs
+    logger.info("link4m API status=%s raw_response=%r", resp.status_code, raw_text[:500])
+
+    if resp.status_code != 200:
+        logger.error("link4m API trả về mã lỗi HTTP %s: %s", resp.status_code, raw_text[:500])
+        return None
+
+    # Trường hợp 1: phản hồi là JSON
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            for key in (
+                "shortenedUrl", "shortened_url", "shorten_url", "shortUrl",
+                "short_url", "url", "link", "data", "result",
+            ):
+                val = data.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    return val
+                if isinstance(val, dict):
+                    inner = val.get("shortenedUrl") or val.get("url") or val.get("shortUrl")
+                    if isinstance(inner, str) and inner.startswith("http"):
+                        return inner
+            logger.warning("link4m trả JSON nhưng không tìm thấy field link hợp lệ: %s", data)
+    except ValueError:
+        pass  # không phải JSON, thử cách khác bên dưới
+
+    # Trường hợp 2: phản hồi là plain text, chỉ chứa mỗi link
+    if raw_text.startswith("http"):
+        return raw_text.split()[0]
+
+    # Trường hợp 3: link nằm lẫn trong 1 đoạn text khác
+    import re
+    match = re.search(r"https?://\S+", raw_text)
+    if match:
+        return match.group(0)
+
+    logger.error("Không nhận diện được link4m response, raw=%r", raw_text[:500])
+    return None
 
 
 # ============================================================
@@ -537,10 +584,18 @@ async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def do_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        me = await context.bot.get_me()
-        BOT_USERNAME = me.username
+
+    base_url = cfg("web_base_url", "") or os.environ.get("RENDER_EXTERNAL_URL", "")
+    base_url = base_url.rstrip("/")
+    if not base_url:
+        await render_cb(
+            update,
+            "❌ Admin chưa cấu hình địa chỉ web xác nhận nhiệm vụ.\n\n"
+            "(Admin: gõ lệnh <code>/setweburl https://ten-app-cua-ban.onrender.com</code> "
+            "để đặt, hoặc bot sẽ tự nhận nếu deploy dạng Web Service trên Render.)",
+            back_kb(),
+        )
+        return
 
     token = uuid.uuid4().hex
     reward_money = random.randint(int(cfg("reward_min", 150)), int(cfg("reward_max", 500)))
@@ -554,18 +609,26 @@ async def do_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    dest = f"https://t.me/{BOT_USERNAME}?start=task_{token}"
+    # Link đích là trang web riêng /<user_id>/<token> - chỉ đúng user này, đúng token
+    # này mới xác nhận hoàn thành được, và chỉ dùng được đúng 1 lần.
+    dest = f"{base_url}/{user_id}/{token}"
     short_link = create_link4m(dest)
 
     if not short_link:
-        await render_cb(update, "❌ Không tạo được link nhiệm vụ lúc này, vui lòng thử lại sau ít phút.", back_kb())
+        await render_cb(
+            update,
+            "❌ Không tạo được link nhiệm vụ lúc này, vui lòng thử lại sau ít phút.\n\n"
+            "(Admin: xem chi tiết lỗi trong log server - Render > Logs, tìm dòng "
+            "'link4m API' để biết chính xác API đã trả về gì.)",
+            back_kb(),
+        )
         return
 
     text = (
         "📝 <b>NHIỆM VỤ MỚI</b>\n\n"
         f"Phần thưởng: <b>{money_fmt(reward_money)}</b> + <b>{reward_coin} coin</b>\n\n"
         "👉 Bấm vào link bên dưới, vượt qua các bước quảng cáo.\n"
-        "Sau khi hoàn thành bạn sẽ được đưa quay lại bot và <b>tự động cộng tiền</b>.\n\n"
+        "Sau khi hoàn thành, trang web sẽ xác nhận và bot <b>tự động cộng tiền</b> ngay lập tức.\n\n"
         f"🔗 {short_link}\n\n"
         "⚠️ Link chỉ dùng được 1 lần và chỉ mình bạn dùng được."
     )
@@ -807,7 +870,9 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE, data:
             "<code>/setlink4m &lt;api_key&gt;</code>\n"
             "<code>/setreward &lt;min&gt; &lt;max&gt;</code>\n"
             "<code>/setrefbonus &lt;số tiền&gt;</code>\n"
-            "<code>/setminwd &lt;min_task&gt; &lt;min_ref&gt;</code>\n\n"
+            "<code>/setminwd &lt;min_task&gt; &lt;min_ref&gt;</code>\n"
+            "<code>/setweburl &lt;https://ten-app.onrender.com&gt;</code>\n\n"
+            f"🌐 Web base url hiện tại: <code>{cfg('web_base_url') or 'chưa đặt'}</code>\n\n"
             "📡 Để đặt <b>kênh xác minh</b>: thêm bot làm admin trong kênh/group, "
             "bot sẽ tự động lưu kênh đó."
         )
@@ -1089,29 +1154,159 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# MINI HTTP SERVER (để Render Web Service không báo lỗi healthcheck)
+# WEB APP (Flask) - trang xác nhận hoàn thành nhiệm vụ link4m
+# URL dạng: https://ten-app.onrender.com/<user_id>/<token>
 # ============================================================
 
-def run_health_server():
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Bot is running")
+flask_app = Flask(__name__)
 
-        def log_message(self, *a):
-            pass
+PAGE_BASE = """
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+    background: linear-gradient(135deg, {{ grad1 }} 0%, {{ grad2 }} 100%);
+    padding: 20px;
+  }}
+  .card {{
+    background: #fff; border-radius: 20px; padding: 40px 32px; max-width: 420px; width: 100%;
+    text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,0.25);
+  }}
+  .icon {{ font-size: 64px; margin-bottom: 10px; }}
+  h1 {{ font-size: 22px; color: #222; margin: 10px 0; }}
+  p {{ color: #666; font-size: 15px; line-height: 1.6; }}
+  .reward {{
+    background: linear-gradient(135deg, #11998e, #38ef7d);
+    color: #fff; border-radius: 14px; padding: 18px; margin: 20px 0; font-size: 20px; font-weight: bold;
+  }}
+  .btn {{
+    display: inline-block; margin-top: 16px; padding: 12px 28px; border-radius: 30px;
+    background: #229ED9; color: #fff; text-decoration: none; font-weight: 600; font-size: 15px;
+  }}
+  .footer {{ margin-top: 24px; font-size: 12px; color: #aaa; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">{{ icon }}</div>
+    <h1>{{ title }}</h1>
+    <p>{{ message }}</p>
+    {% if reward %}<div class="reward">{{ reward }}</div>{% endif %}
+    <a class="btn" href="https://t.me/{{ bot_username }}">Quay lại Bot Telegram</a>
+    <div class="footer">Bot Kiếm Tiền Online</div>
+  </div>
+</body>
+</html>
+"""
 
-    class ReusableTCPServer(socketserver.TCPServer):
-        allow_reuse_address = True
 
+async def notify_task_complete(user_id: int, money: int, coin: int):
+    """Gửi/edit tin nhắn dashboard trên Telegram ngay khi user hoàn thành nhiệm vụ qua web."""
+    user = get_user(user_id)
+    if not user:
+        return
+    text = (
+        "✅ <b>HOÀN THÀNH NHIỆM VỤ THÀNH CÔNG!</b>\n\n"
+        f"+ {money_fmt(money)}\n"
+        f"+ {coin} coin\n\n"
+        f"💰 Số dư hiện tại: <b>{money_fmt(user['task_balance'] + user['ref_balance'])}</b>\n"
+        f"🪙 Coin hiện tại: <b>{user['coin']}</b>"
+    )
+    kb = back_kb()
+    msg_id = user["last_msg_id"]
     try:
-        with ReusableTCPServer(("0.0.0.0", PORT), Handler) as httpd:
-            httpd.serve_forever()
+        if msg_id:
+            await BOT_INSTANCE.edit_message_text(
+                chat_id=user_id, message_id=msg_id, text=text, reply_markup=kb, parse_mode="HTML"
+            )
+            return
+    except Exception:
+        pass
+    try:
+        sent = await BOT_INSTANCE.send_message(chat_id=user_id, text=text, reply_markup=kb, parse_mode="HTML")
+        set_last_msg(user_id, sent.message_id)
+    except Exception as e:
+        logger.warning("Không gửi được thông báo Telegram cho user %s: %s", user_id, e)
+
+
+@flask_app.route("/")
+def web_health():
+    return "Bot is running", 200
+
+
+@flask_app.route("/<int:user_id>/<token>")
+def web_complete_task(user_id, token):
+    # chỉ chấp nhận token dạng hex (từ uuid4().hex) để tránh truy vấn linh tinh
+    if not re.fullmatch(r"[a-f0-9]{32}", token):
+        return render_template_string(
+            PAGE_BASE, title="Link không hợp lệ", icon="❌",
+            message="Đường dẫn không đúng định dạng.", reward=None,
+            bot_username=BOT_USERNAME or "", grad1="#ff5f6d", grad2="#ffc371",
+        ), 400
+
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM tasks WHERE token=?", (token,)).fetchone()
+
+    if not row:
+        conn.close()
+        return render_template_string(
+            PAGE_BASE, title="Link không tồn tại", icon="❌",
+            message="Link nhiệm vụ này không tồn tại hoặc đã hết hạn.", reward=None,
+            bot_username=BOT_USERNAME or "", grad1="#ff5f6d", grad2="#ffc371",
+        ), 404
+
+    if row["used"]:
+        conn.close()
+        return render_template_string(
+            PAGE_BASE, title="Link đã được sử dụng", icon="⚠️",
+            message="Link này chỉ dùng được đúng 1 lần và đã được sử dụng trước đó. "
+                    "Vui lòng quay lại bot để lấy nhiệm vụ mới.", reward=None,
+            bot_username=BOT_USERNAME or "", grad1="#f7971e", grad2="#ffd200",
+        ), 410
+
+    if row["user_id"] != user_id:
+        conn.close()
+        return render_template_string(
+            PAGE_BASE, title="Link không thuộc về bạn", icon="🚫",
+            message="Link nhiệm vụ này được tạo cho một tài khoản khác, không thể sử dụng.", reward=None,
+            bot_username=BOT_USERNAME or "", grad1="#ff5f6d", grad2="#ffc371",
+        ), 403
+
+    conn.execute("UPDATE tasks SET used=1 WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
+
+    add_balance(user_id, row["reward_money"], row["reward_coin"], "task", "task")
+
+    if MAIN_LOOP:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                notify_task_complete(user_id, row["reward_money"], row["reward_coin"]), MAIN_LOOP
+            )
+        except Exception as e:
+            logger.error("Không lên lịch được thông báo Telegram: %s", e)
+
+    return render_template_string(
+        PAGE_BASE, title="Hoàn thành nhiệm vụ!", icon="🎉",
+        message="Bạn đã hoàn thành nhiệm vụ thành công. Phần thưởng đã được cộng thẳng vào tài khoản Telegram của bạn.",
+        reward=f"+ {money_fmt(row['reward_money'])}  •  + {row['reward_coin']} coin",
+        bot_username=BOT_USERNAME or "", grad1="#11998e", grad2="#38ef7d",
+    ), 200
+
+
+def run_web_server():
+    try:
+        flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
     except OSError as e:
-        # Không để lỗi bind cổng (vd cổng đã có tiến trình khác dùng) làm crash cả app.
-        # Bot Telegram vẫn chạy bình thường qua polling, chỉ mất phần healthcheck HTTP.
-        logger.warning("Không mở được health server ở cổng %s: %s", PORT, e)
+        # Không để lỗi bind cổng làm crash cả app - bot Telegram vẫn chạy bình thường qua polling.
+        logger.warning("Không mở được web server ở cổng %s: %s", PORT, e)
 
 
 # ============================================================
@@ -1161,9 +1356,26 @@ async def is_verified(context, user_id):  # noqa: F811 (override có chủ đíc
 # MAIN
 # ============================================================
 
+async def cmd_setweburl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Cú pháp: /setweburl <https://ten-app.onrender.com>")
+        return
+    set_cfg("web_base_url", context.args[0].rstrip("/"))
+    await update.message.reply_text("✅ Đã cập nhật địa chỉ web xác nhận nhiệm vụ.")
+
+
 def main():
+    global BOT_USERNAME, MAIN_LOOP, BOT_INSTANCE
+
     init_db()
-    threading.Thread(target=run_health_server, daemon=True).start()
+
+    # Nếu deploy trên Render dạng Web Service, biến RENDER_EXTERNAL_URL được
+    # Render tự cấp - dùng luôn làm web_base_url nếu admin chưa tự đặt.
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if render_url and not cfg("web_base_url"):
+        set_cfg("web_base_url", render_url.rstrip("/"))
 
     # Một số bản Python mới (3.12+) không còn tự tạo event loop mặc định ở
     # main thread nữa, khiến python-telegram-bot báo lỗi "no current event
@@ -1181,12 +1393,26 @@ def main():
     app.add_handler(CommandHandler("setreward", cmd_setreward))
     app.add_handler(CommandHandler("setrefbonus", cmd_setrefbonus))
     app.add_handler(CommandHandler("setminwd", cmd_setminwd))
+    app.add_handler(CommandHandler("setweburl", cmd_setweburl))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    logger.info("Bot đang khởi động...")
+    # lấy username bot + lưu instance bot + event loop hiện tại để thread Flask dùng được
+    BOT_INSTANCE = app.bot
+    MAIN_LOOP = asyncio.get_event_loop()
+
+    async def _fetch_username():
+        global BOT_USERNAME
+        me = await app.bot.get_me()
+        BOT_USERNAME = me.username
+
+    MAIN_LOOP.run_until_complete(_fetch_username())
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+
+    logger.info("Bot đang khởi động... web_base_url=%s", cfg("web_base_url"))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
