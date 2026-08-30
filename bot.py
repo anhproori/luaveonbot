@@ -67,9 +67,9 @@ from telegram.error import BadRequest
 # này từng bị dán/commit kèm token thật ở bất kỳ đâu, hãy vào @BotFather ->
 # /mybots -> API Token -> Revoke current token để thu hồi ngay, rồi set token
 # MỚI qua biến môi trường bên dưới. Bot sẽ không khởi động nếu thiếu biến bắt buộc.
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
-LINK4M_API_KEY_DEFAULT = os.environ.get("LINK4M_API_KEY", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8765543353:AAFbd4IYTzk8bUn2njECLbx8Z3Gb_LWa4_A")
+ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "8685327154")
+LINK4M_API_KEY_DEFAULT = os.environ.get("LINK4M_API_KEY", "6a93e433c1e0cd622c1112a8")
 
 if not BOT_TOKEN:
     raise SystemExit("❌ Thiếu biến môi trường BOT_TOKEN. Hãy set BOT_TOKEN trong Render > Environment.")
